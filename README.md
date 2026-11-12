@@ -46,6 +46,7 @@
 > 🍎 **macOS 用户**：这个仓库目前只支持 Windows，请使用 [wangmeng003](https://github.com/wangmeng003) 维护的 Mac 移植版：[claude-desk-pet-mac](https://github.com/wangmeng003/claude-desk-pet-mac)
 
 - **Windows**（悬浮窗和提示音用的是 Windows 的接口）
+- **Linux**：需要 `python3`、PyGObject、GTK3；Wayland 下还要 `gtk-layer-shell`（合成器要支持 layer-shell，如 niri、Sway、Hyprland），X11 下会退回成普通置顶窗口。提示音用 `pw-play` / `paplay` / `aplay` 播放。「切到 Claude 时自动隐藏」和双击叫出 Claude 目前只在 niri 下可用。Arch 上安装：`sudo pacman -S python-gobject gtk3 gtk-layer-shell`（Linux 版不需要 Pillow）
 - **Python 3**，并且在命令行里输入 `python` 能直接运行
 - **Pillow** 图像库，用下面这条命令安装：
 

@@ -71,7 +71,7 @@ async function readSession($: EngineInterface) {
   return ((await $.store.get(sessionKey)) as SessionRecord | undefined) ?? { totals: EMPTY, lastCost: 0 }
 }
 
-// 写状态文件给悬浮窗读；sound 让悬浮窗播放提示音（引擎在 Windows 上没有播放器）
+// 写状态文件给悬浮窗读；sound 让悬浮窗播放提示音（引擎在 Windows 和 Linux 上没有播放器）
 // 出错也不能影响 Claude 干活
 async function pet($: EngineInterface, state: PetState, text: string, sound?: 'done' | 'error') {
   if (!petFile) return
@@ -83,10 +83,13 @@ async function pet($: EngineInterface, state: PetState, text: string, sound?: 'd
 
 async function launchPet($: EngineInterface) {
   try {
-    // 引擎不按 PATH 找程序，交给 Windows 自带的 cmd.exe 去找 python
-    // （cmd.exe 的路径必须用反斜杠，用正斜杠时 cmd 会把 /Windows 当成开关）
+    // 引擎不按 PATH 找程序：Windows 交给自带的 cmd.exe 去找 python
+    // （cmd.exe 的路径必须用反斜杠，用正斜杠时 cmd 会把 /Windows 当成开关）；Linux 交给 /usr/bin/env 找 python3
+    const windows = (await $.env.get('OS')) === 'Windows_NT'
+    const launcher = windows ? ['C:\\Windows\\System32\\cmd.exe', '/d', '/c', 'python'] : ['/usr/bin/env', 'python3']
+    const script = windows ? 'pet.pyw' : 'pet_linux.py'
     const ran = await $.process.run(
-      ['C:\\Windows\\System32\\cmd.exe','/d', '/c', 'python', `${$.plugin.root}/pet/launch.py`, `${$.plugin.root}/pet/pet.pyw`, runDir],
+      [...launcher, `${$.plugin.root}/pet/launch.py`, `${$.plugin.root}/pet/${script}`, runDir],
       { timeoutMs: 15000 },
     )
     if (ran.exitCode !== 0) {
