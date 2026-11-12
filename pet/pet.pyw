@@ -1,5 +1,6 @@
 # Claude 娘桌宠悬浮窗
 # mod 把每个会话的状态写进 <运行目录>/sessions/<会话id>.json，这里读最新的那个来换表情和气泡。
+# 显示什么、怎么动由 pet_core.py 里的“大脑”决定（和 Linux 版共用），这里只管窗口、画图和鼠标。
 # 用法：pythonw pet.pyw <运行目录>
 import ctypes
 import ctypes.wintypes as wt
@@ -16,6 +17,8 @@ import winsound
 
 from PIL import Image, ImageDraw, ImageFont
 
+import pet_core as core
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOUNDS = os.path.join(os.path.dirname(HERE), 'sounds')
 RUN_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.expanduser('~'), '.claude', 'desk-pet')
@@ -23,10 +26,11 @@ SESSIONS = os.path.join(RUN_DIR, 'sessions')
 SETTINGS = os.path.join(RUN_DIR, 'settings.json')
 
 # 只允许开一个桌宠：占住一个本地端口，占不到说明已经有一个在跑
+# （开发时想在正式的桌宠旁边再开一个试验用的，用 CLAUDE_DESK_PET_PORT 换个端口）
 try:
     _lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _lock.bind(('127.0.0.1', 47321))
-except OSError:
+    _lock.bind(('127.0.0.1', int(os.environ.get('CLAUDE_DESK_PET_PORT', 47321))))
+except (OSError, ValueError):
     sys.exit(0)
 
 try:
@@ -34,29 +38,15 @@ try:
 except Exception:
     pass
 
-# 状态 → 立绘
-SPRITES = {
-    'thinking': 'smile-closed',
-    'tool': 'typing',
-    'reading': 'notes',
-    'waiting': 'knock',
-    'celebrate': 'confetti',
-    'idle': 'smile',
-    'error': 'panic',
-    'aborted': 'guilty',
-    'stone': 'stone',
-}
 SIZES = {'小': 140, '中': 190, '大': 250}  # 角色高度（100% 缩放下的像素）
-IDLE_AFTER = 10 * 60  # 等你回复超过 10 分钟就开始发呆
 ORANGE = (232, 116, 59, 255)   # 气泡描边
 CREAM = (255, 250, 243, 255)   # 气泡底色
 INK = (58, 42, 26, 255)        # 气泡文字
-ANIMATED = {'thinking', 'tool', 'reading'}  # 这些状态下，台词末尾的“…”会变成跳动的点点点
 DOTS = '...'
 SS = 4  # 气泡先按 4 倍大小画再缩小，圆角和尾巴的边缘更平滑
-HOP = 14  # 换状态时跳起的高度
-BOB = 3   # 平时上下晃动的最大幅度
+HOP, BOB = core.HOP, core.BOB  # 换状态时跳起的高度、平时上下晃动的最大幅度
 GAP = 4   # 跳到最高时，头顶和气泡尖之间至少留这么多
+DRAG_START = 4  # 按住挪动超过这么多像素才算拖动，不然是点了一下
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -302,13 +292,12 @@ class Pet:
         self.canvas.pack()
         self.font = ('Microsoft YaHei UI', 10)  # 右键菜单用
 
-        self.state, self.text, self.project = 'waiting', '我来啦～', ''
-        self.state_since = time.time()
+        self.brain = core.Brain(core.Stats(os.path.join(RUN_DIR, 'stats.json')))
+        self.look = self.brain.look(time.time())
         self.last_mtime = 0
-        self.last_mtime_seen = 0
-        self.hop_at = time.time()
         self.hidden = False
-        self.drag = None
+        self.press = None      # 左键按下时的 (鼠标的屏幕位置, 窗口位置)，松开或双击后清掉
+        self.dragging = False  # 按住之后挪得够远，被拎起来了
         self.last_alive = time.time()
         self.last_frame = None
 
@@ -322,7 +311,8 @@ class Pet:
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<Double-Button-1>', self.on_double)
-        self.canvas.bind('<Button-3>', lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+        self.canvas.bind('<Motion>', self.on_hover)
+        self.canvas.bind('<Button-3>', self.on_menu)
 
         self.poll()
         self.animate()
@@ -333,11 +323,21 @@ class Pet:
     def build(self):
         s = self.scale
         h = round(SIZES.get(self.settings.get('size', '中'), 190) * s)
-        self.sprites = {state: prepare(os.path.join(HERE, 'sprites', name + '.png'), h)
-                        for state, name in SPRITES.items()}
+
+        def path(name):
+            return os.path.join(HERE, 'sprites', name + '.png')
+
+        self.sprites = {}
+        for name in core.sprite_names():
+            # 缺的图用替补顶上（换了自己的立绘包、还没画新表情的时候）
+            found = core.resolve_sprite(name, lambda n: os.path.exists(path(n)))
+            if found:
+                self.sprites[name] = prepare(path(found), h)
         self.char_h = h
         self.char_w = max(im.width for im in self.sprites.values())
-        self.W = max(self.char_w, round(190 * s))
+        # 两边各留一点，被拎起来晃、晕得东倒西歪的时候不会出框
+        self.sway = round(h * 0.12)
+        self.W = max(self.char_w + 2 * self.sway, round(190 * s))
         # 气泡在最上面，下面给跳跃和晃动留够空间，角色怎么动都碰不到气泡，也不会出窗口底边
         self.bubble_bottom = round(38 * s)
         self.tail_tip = self.bubble_bottom + round(10 * s)
@@ -352,16 +352,16 @@ class Pet:
         s, measure = self.scale, self.pfont.getlength
         pad = round(10 * s)
         max_w = self.W - 2 * pad - 4
-        state = self.effective_state()
-        text, self.dots_base = self.display_text(), None
-        if state in ANIMATED and (text.endswith('…') or text == '思考中'):
+        look = self.look
+        text, self.dots_base = look.text, None
+        if look.dots:
             # 末尾的省略号换成一跳一跳的点点点；文字左对齐，按三个点的宽度留好位置，点数变化时文字不会左右晃
             self.dots_base = fit_text(text.rstrip('…'), max_w - measure(DOTS), measure)
             text = self.dots_base + DOTS
         else:
             text = fit_text(text, max_w, measure)
         text_w = measure(text)
-        self.bubble_state = state
+        self.bubble_key = (look.sprite, look.text, look.dots)
         self.bubble_text = text
         self.text_x = self.W / 2 - text_w / 2
         x0 = max(1, math.floor(self.text_x) - pad)
@@ -401,26 +401,21 @@ class Pet:
             self.bubble_cache[text] = im
         return im
 
-    def render(self, state, y, text):
-        key = (state, y, text, id(self.bubble_bg))
+    def render(self, name, y, angle, pivot, text):
+        """画一帧：立绘 name 画在高度 y，绕身体上 pivot 那个位置顺时针转 angle 度，上面盖上气泡。"""
+        key = (name, y, angle, text, id(self.bubble_bg))
         if key == self.last_frame:
             return
         self.last_frame = key
         frame = Image.new('RGBA', (self.W, self.H), (0, 0, 0, 0))
-        sprite = self.sprites[state]
+        sprite = self.sprites.get(name) or self.sprites.get('knock') or next(iter(self.sprites.values()))
         frame.alpha_composite(sprite, (self.W // 2 - sprite.width // 2, max(0, y)))
+        if angle:
+            # 整层一起转（立绘自己的画布太紧，单独转会被裁掉边角）；预乘透明度再转，边缘不带杂色
+            center = (self.W / 2, max(0, y) + self.char_h * pivot)
+            frame = frame.convert('RGBa').rotate(-angle, resample=Image.BICUBIC, center=center).convert('RGBA')
         frame.alpha_composite(self.bubble_with(text), (0, 0))
         self.layer.show(frame)
-
-    def display_text(self):
-        if self.effective_state() == 'idle':
-            return '在发呆～ zZ'
-        return self.text
-
-    def effective_state(self):
-        if self.state == 'waiting' and time.time() - self.state_since > IDLE_AFTER:
-            return 'idle'
-        return self.state
 
     def place_window(self, x=None, y=None):
         if x is None:
@@ -437,6 +432,11 @@ class Pet:
 
     def make_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0, font=self.font)
+        # 最上面两行是今天的小结，只是看的，点不了；每次打开菜单时更新
+        self.menu.add_command(label='', state='disabled')
+        self.menu.add_command(label='', state='disabled')
+        self.menu.add_command(label='喂一块小饼干', command=lambda: self.brain.treat(time.time()))
+        self.menu.add_separator()
         size_menu = tk.Menu(self.menu, tearoff=0, font=self.font)
         self.size_var = tk.StringVar(value=self.settings.get('size', '中'))
         for name in SIZES:
@@ -476,20 +476,54 @@ class Pet:
         save_settings(self.settings)
 
     # ---------- 鼠标 ----------
+    def on_menu(self, e):
+        now = time.time()
+        self.menu.entryconfig(0, label=self.brain.stats.summary(now))
+        self.menu.entryconfig(1, label=f'好感度 ♥ {self.brain.stats.bond()}')
+        self.menu.tk_popup(e.x_root, e.y_root)
+
     def on_press(self, e):
-        self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+        self.press = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
+        self.dragging = False
+        self.last_x = e.x_root
 
     def on_drag(self, e):
-        if self.drag:
-            self.root.geometry(f'+{e.x_root - self.drag[0]}+{e.y_root - self.drag[1]}')
+        if not self.press:
+            return
+        x0, y0, win_x, win_y = self.press
+        now = time.time()
+        if not self.dragging:
+            if abs(e.x_root - x0) + abs(e.y_root - y0) < DRAG_START * self.scale:
+                return
+            self.dragging = True  # 挪得够远了：被拎起来
+            self.brain.lift(now)
+        self.brain.carry((e.x_root - self.last_x) / self.scale, now)
+        self.last_x = e.x_root
+        self.root.geometry(f'+{win_x + e.x_root - x0}+{win_y + e.y_root - y0}')
 
     def on_release(self, e):
-        self.drag = None
+        if not self.press:
+            return
+        self.press = None
+        if not self.dragging:
+            self.brain.click(time.time())  # 没拖动：戳了一下
+            return
+        self.dragging = False
+        self.brain.drop(time.time())
         self.settings['x'], self.settings['y'] = self.root.winfo_x(), self.root.winfo_y()
         save_settings(self.settings)
 
+    def on_hover(self, e):
+        # 没按着键在身上挪：在头上来回蹭就是摸头。头大概是立绘上面那一半
+        if self.press:
+            return
+        on_head = self.rest_y <= e.y <= self.rest_y + self.char_h * 0.5
+        self.brain.hover(e.x / self.scale, time.time(), on_head)
+
     def on_double(self, e):
-        # 双击：把 Claude 窗口叫到前台
+        # 双击：把 Claude 窗口叫到前台（前一下单击不算戳）
+        self.press = None
+        self.brain.double_click()
         hwnd = find_claude_window()
         if hwnd:
             if user32.IsIconic(hwnd):
@@ -500,54 +534,34 @@ class Pet:
     def poll(self):
         latest = read_latest()
         if latest and latest[0] != self.last_mtime:
-            self.last_mtime_seen, self.last_mtime = self.last_mtime, latest[0]
-            data = latest[1]
-            state = data.get('state', 'waiting')
-            if state not in SPRITES:
-                state = 'waiting'
-            changed = state != self.state
-            self.state, self.text = state, data.get('text', '')
-            self.project = data.get('project', '')
-            self.state_since = time.time()
-            sound = data.get('sound')
-            if sound in ('done', 'error') and self.sound_var.get() and self.last_mtime_seen:  # 刚启动时不重播旧提示音
+            self.last_mtime = latest[0]
+            sound = self.brain.update(latest[1], time.time())  # 刚启动时读到的旧提示音，大脑不会让它重播
+            if sound and self.sound_var.get():
                 try:
                     winsound.PlaySound(os.path.join(SOUNDS, sound + '.wav'),
                                        winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
                 except Exception:
                     pass
-            if changed:
-                self.hop_at = time.time()
-            self.draw_bubble()
-        elif self.effective_state() != self.bubble_state:  # 等太久，进入发呆
-            self.draw_bubble()
         self.root.after(250, self.poll)
 
     def animate(self):
         t = time.time()
-        st = self.effective_state()
-        s = self.scale
-        if st == 'stone':
-            bob = 0
-        elif st == 'tool':
-            bob = 2.5 * math.sin(t * 9)   # 敲键盘：快速小幅抖动
-        elif st == 'error':
-            bob = 2 * math.sin(t * 25)    # 慌张：发抖
-        else:
-            bob = 3 * math.sin(t * 2.2)   # 平时：慢慢呼吸
-        since = t - self.hop_at
-        hop = -HOP * math.sin(since / 0.28 * math.pi) if since < 0.28 else 0  # 换状态时小跳一下
-        y = self.rest_y + round((bob + hop) * s)
+        self.look = self.brain.look(t)
+        if (self.look.sprite, self.look.text, self.look.dots) != self.bubble_key:
+            # 换了立绘或台词：新状态、互动，或者等太久发呆、睡着了
+            self.draw_bubble()
+        pose = self.brain.pose(t, self.look)
+        y = self.rest_y + round(pose.dy * self.scale)
         text = self.bubble_text
         if self.dots_base is not None:
             # “思考中…” 这类进行中的台词，后面的点点点一跳一跳
             text = self.dots_base + '.' * (int(t * 2.5) % 3 + 1)
         if not self.hidden:
-            self.render(st, y, text)
+            self.render(self.look.sprite, y, round(pose.angle, 1), pose.pivot, text)
         self.root.after(33, self.animate)
 
     def watch_focus(self):
-        should_hide = self.hide_var.get() and claude_is_foreground() and self.drag is None
+        should_hide = self.hide_var.get() and claude_is_foreground() and self.press is None
         if should_hide and not self.hidden:
             self.root.withdraw()
             self.hidden = True

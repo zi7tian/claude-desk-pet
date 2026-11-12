@@ -1,6 +1,7 @@
 # Claude 娘桌宠悬浮窗（Linux 版，GTK3）
 # Wayland 下用 gtk-layer-shell 做置顶悬浮层；X11 下退回成普通的无边框置顶窗口。
 # mod 把每个会话的状态写进 <运行目录>/sessions/<会话id>.json，这里读最新的那个来换表情和气泡。
+# 显示什么、怎么动由 pet_core.py 里的“大脑”决定（和 Windows 版共用），这里只管窗口、画图和鼠标。
 # 用法：python3 pet_linux.py <运行目录>
 import glob
 import json
@@ -26,6 +27,8 @@ gi.require_version('Pango', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
+import pet_core as core  # noqa: E402
+
 try:
     gi.require_version('GtkLayerShell', '0.1')
     from gi.repository import GtkLayerShell
@@ -39,35 +42,22 @@ SESSIONS = os.path.join(RUN_DIR, 'sessions')
 SETTINGS = os.path.join(RUN_DIR, 'settings.json')
 
 # 只允许开一个桌宠：占住一个本地端口，占不到说明已经有一个在跑
+# （开发时想在正式的桌宠旁边再开一个试验用的，用 CLAUDE_DESK_PET_PORT 换个端口）
 try:
     _lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _lock.bind(('127.0.0.1', 47321))
-except OSError:
+    _lock.bind(('127.0.0.1', int(os.environ.get('CLAUDE_DESK_PET_PORT', 47321))))
+except (OSError, ValueError):
     sys.exit(0)
 
-# 状态 → 立绘
-SPRITES = {
-    'thinking': 'smile-closed',
-    'tool': 'typing',
-    'reading': 'notes',
-    'waiting': 'knock',
-    'celebrate': 'confetti',
-    'idle': 'smile',
-    'error': 'panic',
-    'aborted': 'guilty',
-    'stone': 'stone',
-}
 SIZES = {'小': 140, '中': 190, '大': 250}  # 角色高度（逻辑像素）
-IDLE_AFTER = 10 * 60  # 等你回复超过 10 分钟就开始发呆
 FONT = 'Sans 10'
 ORANGE = (0xe8 / 255, 0x74 / 255, 0x3b / 255)
 BUBBLE_BG = (0xff / 255, 0xfa / 255, 0xf3 / 255)
 TEXT = (0x3a / 255, 0x2a / 255, 0x1a / 255)
-ANIMATED = {'thinking', 'tool', 'reading'}  # 这些状态下，台词末尾的“…”会变成跳动的点点点
 DOTS = '...'
-HOP = 14  # 换状态时跳起的高度
-BOB = 3   # 平时上下晃动的最大幅度
+HOP, BOB = core.HOP, core.BOB  # 换状态时跳起的高度、平时上下晃动的最大幅度
 GAP = 4   # 跳到最高时，头顶和气泡尖之间至少留这么多
+DRAG_START = 4  # 按住挪动超过这么多像素才算拖动，不然是点了一下
 CLAUDE_APP_IDS = ('com.anthropic.claude', 'claude')
 CLAUDE_PROCS = ('claude', 'claude-desktop')
 
@@ -234,19 +224,18 @@ class Pet:
                              | Gdk.EventMask.POINTER_MOTION_MASK)
         self.area.connect('draw', self.on_draw)
         self.area.connect('button-press-event', self.on_press)
-        self.area.connect('motion-notify-event', self.on_drag)
+        self.area.connect('motion-notify-event', self.on_motion)
         self.area.connect('button-release-event', self.on_release)
         self.area.connect('size-allocate', self.on_allocate)
         self.win.add(self.area)
         self.win.connect('destroy', Gtk.main_quit)
 
-        self.state, self.text, self.project = 'waiting', '我来啦～', ''
-        self.state_since = time.time()
+        self.brain = core.Brain(core.Stats(os.path.join(RUN_DIR, 'stats.json')))
+        self.look = self.brain.look(time.time())
         self.last_mtime = 0
-        self.last_mtime_seen = 0
-        self.hop_at = time.time()
         self.hidden = False
-        self.drag = None
+        self.press = None   # 左键按下时的 (鼠标位置, 桌宠位置)，松开或双击后清掉
+        self.drag = None    # 正在拖动时，上一次鼠标的横坐标
         self.last_alive = time.time()
         # 量文字宽度用的排版对象，和绘制时用同一个字体
         self.pango = self.area.create_pango_layout('')
@@ -268,13 +257,21 @@ class Pet:
         h = SIZES.get(self.settings.get('size', '中'), 190)
         # GTK3 只有整数缩放，按 2 倍分辨率加载，分数缩放的屏幕上也不会糊
         self.px = max(2, self.win.get_scale_factor())
+
+        def path(name):
+            return os.path.join(HERE, 'sprites', name + '.png')
+
         self.images = {}
-        for state, name in SPRITES.items():
-            self.images[state] = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                os.path.join(HERE, 'sprites', name + '.png'), -1, h * self.px, True)
+        for name in core.sprite_names():
+            # 缺的图用替补顶上（换了自己的立绘包、还没画新表情的时候）
+            found = core.resolve_sprite(name, lambda n: os.path.exists(path(n)))
+            if found:
+                self.images[name] = GdkPixbuf.Pixbuf.new_from_file_at_scale(path(found), -1, h * self.px, True)
         self.char_h = h
         self.char_w = max(img.get_width() for img in self.images.values()) // self.px
-        self.W = max(self.char_w, 190)
+        # 两边各留一点，被拎起来晃、晕得东倒西歪的时候不会出框
+        self.sway = round(h * 0.12)
+        self.W = max(self.char_w + 2 * self.sway, 190)
         # 气泡在最上面，下面给跳跃和晃动留够空间，角色怎么动都碰不到气泡，也不会出窗口底边
         self.bubble_bottom = 38
         self.tail_tip = self.bubble_bottom + 10
@@ -293,16 +290,16 @@ class Pet:
         """按当前台词排好气泡：算出要显示的文字、文字和气泡的位置。"""
         pad = 10
         max_w = self.W - 2 * pad - 4
-        state = self.effective_state()
-        text, self.dots_base = self.display_text(), None
-        if state in ANIMATED and (text.endswith('…') or text == '思考中'):
+        look = self.look
+        text, self.dots_base = look.text, None
+        if look.dots:
             # 末尾的省略号换成一跳一跳的点点点；文字左对齐，按三个点的宽度留好位置，点数变化时文字不会左右晃
             self.dots_base = fit_text(text.rstrip('…'), max_w - self.measure(DOTS), self.measure)
             text = self.dots_base + DOTS
         else:
             text = fit_text(text, max_w, self.measure)
         text_w = self.measure(text)
-        self.bubble_key = (state, self.display_text(), self.W)
+        self.bubble_key = (look.sprite, look.text, look.dots, self.W)
         self.bubble_text = text
         self.text_x = self.W / 2 - text_w / 2
         x0 = max(1, math.floor(self.text_x) - pad)
@@ -312,15 +309,8 @@ class Pet:
         x0, x1 = min(x0, self.W // 2 - min_half), max(x1, self.W // 2 + min_half)
         self.bubble = (x0, 2, x1, self.bubble_bottom)
 
-    def display_text(self):
-        if self.effective_state() == 'idle':
-            return '在发呆～ zZ'
-        return self.text
-
-    def effective_state(self):
-        if self.state == 'waiting' and time.time() - self.state_since > IDLE_AFTER:
-            return 'idle'
-        return self.state
+    def image(self, look):
+        return self.images.get(look.sprite) or self.images.get('knock') or next(iter(self.images.values()))
 
     def screen_size(self):
         # layer 模式下窗口就是整块屏幕（去掉面板占的地方），按窗口实际大小算
@@ -361,11 +351,22 @@ class Pet:
             self.win.move(sw - self.W - self.right, sh - self.H - self.bottom)
 
     def pet_rect(self):
+        """要重画的那一块：桌宠的框，左右和下面多留一点（身体转起来会稍微探出去）。"""
         ox, oy = self.origin()
-        return ox, oy, self.W, self.H
+        return ox - self.sway, oy, self.W + 2 * self.sway, self.H + self.sway
 
     def make_menu(self):
         self.menu = Gtk.Menu()
+        # 最上面两行是今天的小结，只是看的，点不了；每次打开菜单时更新
+        self.stats_item = Gtk.MenuItem(label='')
+        self.bond_item = Gtk.MenuItem(label='')
+        for item in (self.stats_item, self.bond_item):
+            item.set_sensitive(False)
+            self.menu.append(item)
+        cookie_item = Gtk.MenuItem(label='喂一块小饼干')
+        cookie_item.connect('activate', lambda *_: self.brain.treat(time.time()))
+        self.menu.append(cookie_item)
+        self.menu.append(Gtk.SeparatorMenuItem())
         size_item = Gtk.MenuItem(label='大小')
         size_menu = Gtk.Menu()
         group = None
@@ -455,25 +456,17 @@ class Pet:
         cr.move_to(self.text_x, 20 - logical.height / 2)
         PangoCairo.show_layout(cr, self.pango)
 
-    def sprite_offset(self):
-        t = time.time()
-        st = self.effective_state()
-        if st == 'stone':
-            bob = 0
-        elif st == 'tool':
-            bob = 2.5 * math.sin(t * 9)   # 敲键盘：快速小幅抖动
-        elif st == 'error':
-            bob = 2 * math.sin(t * 25)    # 慌张：发抖
-        else:
-            bob = 3 * math.sin(t * 2.2)   # 平时：慢慢呼吸
-        since = t - self.hop_at
-        hop = -HOP * math.sin(since / 0.28 * math.pi) if since < 0.28 else 0  # 换状态时小跳一下
-        return round(bob + hop)
-
-    def draw_sprite(self, cr, img, still=False):
+    def draw_sprite(self, cr, img, pose=None):
+        """画立绘。pose 是大脑给的姿势（上下挪多少、转多少度）；不给就画静止的。"""
         w = img.get_width() / self.px
+        y = self.rest_y + (round(pose.dy) if pose else 0)
         cr.save()
-        cr.translate(round(self.W / 2 - w / 2), self.rest_y + (0 if still else self.sprite_offset()))
+        if pose and pose.angle:
+            cx, cy = self.W / 2, y + self.char_h * pose.pivot
+            cr.translate(cx, cy)
+            cr.rotate(math.radians(pose.angle))
+            cr.translate(-cx, -cy)
+        cr.translate(round(self.W / 2 - w / 2), y)
         cr.scale(1 / self.px, 1 / self.px)
         Gdk.cairo_set_source_pixbuf(cr, img, 0, 0)
         cr.get_source().set_filter(cairo.FILTER_GOOD)
@@ -486,7 +479,7 @@ class Pet:
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
         cr.translate(*self.origin())
-        self.draw_sprite(cr, self.images[self.effective_state()])
+        self.draw_sprite(cr, self.image(self.look), self.brain.pose(time.time(), self.look))
         self.draw_bubble(cr)
         return True
 
@@ -496,7 +489,7 @@ class Pet:
         try:
             surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.W, self.H)
             cr = cairo.Context(surface)
-            self.draw_sprite(cr, self.images[self.effective_state()], still=True)
+            self.draw_sprite(cr, self.image(self.look))
             x0, y0, x1, y1 = self.bubble
             cr.set_source_rgb(0, 0, 0)
             cr.rectangle(x0, y0, x1 - x0, self.tail_tip - y0)
@@ -511,35 +504,55 @@ class Pet:
     # ---------- 鼠标 ----------
     def on_press(self, widget, e):
         if e.button == 3:
+            now = time.time()
+            self.stats_item.set_label(self.brain.stats.summary(now))
+            self.bond_item.set_label(f'好感度 ♥ {self.brain.stats.bond()}')
             self.menu.popup_at_pointer(e)
             return True
         if e.button != 1:
             return False
         if e.type == Gdk.EventType._2BUTTON_PRESS:
-            # 双击：把 Claude 窗口叫到前台
-            self.drag = None
+            # 双击：把 Claude 窗口叫到前台（前一下单击不算戳）
+            self.press = None
+            self.brain.double_click()
             focus_claude_window()
             return True
         if e.type == Gdk.EventType.BUTTON_PRESS:
-            self.drag = (*self.pointer(e), self.right, self.bottom)
+            self.press = (*self.pointer(e), self.right, self.bottom)
         return True
 
     def pointer(self, e):
         # layer 模式下窗口铺满屏幕不会动，窗口坐标就是屏幕坐标；X11 下直接有屏幕坐标
         return (e.x, e.y) if self.layer else (e.x_root, e.y_root)
 
-    def on_drag(self, widget, e):
-        if not self.drag:
+    def on_motion(self, widget, e):
+        now = time.time()
+        if not self.press:
+            # 没按着键在身上挪：在头上来回蹭就是摸头。头大概是立绘上面那一半
+            top = self.origin()[1] + self.rest_y
+            self.brain.hover(e.x, now, top <= e.y <= top + self.char_h * 0.5)
             return False
         x, y = self.pointer(e)
-        x0, y0, right, bottom = self.drag
+        x0, y0, right, bottom = self.press
+        if self.drag is None:
+            if abs(x - x0) + abs(y - y0) < DRAG_START:
+                return True
+            self.drag = x  # 挪得够远了：被拎起来
+            self.brain.lift(now)
+        self.brain.carry(x - self.drag, now)
+        self.drag = x
         self.move_to(right - round(x - x0), bottom - round(y - y0))
         return True
 
     def on_release(self, widget, e):
-        if e.button != 1 or not self.drag:
+        if e.button != 1 or not self.press:
             return False
+        self.press = None
+        if self.drag is None:
+            self.brain.click(time.time())  # 没拖动：戳了一下
+            return True
         self.drag = None
+        self.brain.drop(time.time())
         self.settings['right'], self.settings['bottom'] = self.right, self.bottom
         save_settings(self.settings)
         self.update_input_region()
@@ -554,33 +567,25 @@ class Pet:
     def poll(self):
         latest = read_latest()
         if latest and latest[0] != self.last_mtime:
-            self.last_mtime_seen, self.last_mtime = self.last_mtime, latest[0]
-            data = latest[1]
-            state = data.get('state', 'waiting')
-            if state not in SPRITES:
-                state = 'waiting'
-            changed = state != self.state
-            self.state, self.text = state, data.get('text', '')
-            self.project = data.get('project', '')
-            self.state_since = time.time()
-            sound = data.get('sound')
-            if sound in ('done', 'error') and self.sound_item.get_active() and self.last_mtime_seen:  # 刚启动时不重播旧提示音
+            self.last_mtime = latest[0]
+            sound = self.brain.update(latest[1], time.time())  # 刚启动时读到的旧提示音，大脑不会让它重播
+            if sound and self.sound_item.get_active():
                 play(sound)
-            if changed:
-                self.hop_at = time.time()
-        if (self.effective_state(), self.display_text(), self.W) != self.bubble_key:  # 台词变了，或等太久进入发呆
-            self.layout_bubble()
-            self.update_input_region()
         GLib.timeout_add(250, self.poll)
         return False
 
     def animate(self):
+        self.look = self.brain.look(time.time())
+        if (self.look.sprite, self.look.text, self.look.dots, self.W) != self.bubble_key:
+            # 换了立绘或台词：新状态、互动，或者等太久发呆、睡着了
+            self.layout_bubble()
+            self.update_input_region()
         # 只重画桌宠那一块，整屏重画太浪费
         self.area.queue_draw_area(*self.pet_rect())
         return True
 
     def watch_focus(self):
-        should_hide = self.hide_item.get_active() and self.drag is None and claude_is_foreground()
+        should_hide = self.hide_item.get_active() and self.press is None and claude_is_foreground()
         if should_hide and not self.hidden:
             self.win.hide()
             self.hidden = True
